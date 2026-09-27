@@ -13,45 +13,63 @@ Improve ZapFast while keeping fixes upstream-friendly.
 ## Build
 Current build command on this machine:
 
+```bash
 env CC=gcc CXX=g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc cargo check
+```
 
-Build currently succeeds.
+For test builds on this laptop (8 GB RAM):
 
-## Confirmed issues to investigate
+```bash
+env CC=gcc CXX=g++ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc CARGO_BUILD_JOBS=1 cargo test --lib -- <test_name>
+```
 
-### 1. Chat classification
-- Archived chats, channels and communities are not separated correctly.
-- Contacts related to groups may appear as standalone chats.
-- Sidebar filters exist but classification appears incomplete.
+## Current branch
+`fix/empty-chat-rows`
 
-### 2. Archive sync
-- Archived chats sometimes remain in archived state until manually unarchived.
-- Remote state reconciliation needs investigation.
+## Confirmed root issue
 
-### 3. Stickers
-- Some sticker thumbnails remain placeholders.
-- Sticker sending can be slow.
-- Recent/favorites behavior is incomplete or missing.
+`Worker::emit_chats` currently contains:
 
-### 4. Image viewer
-- Mouse wheel zoom works.
-- Touchpad pinch zoom does not.
+```rust
+chats.retain(|chat| chat.last.is_some() || self.canonical_str(&chat.id) == chat.id);
+```
 
-### 5. KDE Secret Service compatibility
-Previously reproduced on ZapFast 0.14.0:
-- ZapFast created its keyring item but stored an empty secret under ksecretd.
-- Manual valid 32-character secret allowed ZapFast to continue normally.
-- ksecretd also crashed once with SIGSEGV in QCA/OpenSSL.
-- Current source version is 0.17.0; this should be re-tested before touching code.
+For canonical direct JIDs such as `<phone>@s.whatsapp.net`, the canonical comparison (`self.canonical_str(&chat.id) == chat.id`) evaluates to `true`. Consequently, empty direct-chat rows survive indefinitely in `self.chats` even when there is no message, no activity, and no user state.
 
-## Development rules
-- One bug per branch.
-- Small upstream-friendly fixes.
-- Avoid unrelated refactors.
-- Preserve project style.
-- Add tests when practical.
-- Run cargo fmt, cargo clippy and cargo test before PRs.
+The original logic was introduced in the commit with `early_privacy_id_mute_reaches_the_canonical_chat_without_a_duplicate` to remove mapped `@lid` privacy-ID duplicates, not to intentionally expose every canonical empty direct chat from the phone's address book or group participant lists.
 
-## Next task
-Repository reconnaissance only.
-Do not modify code until architecture has been mapped.
+## Important regression discovered
+
+Filtering empty direct chats only in `Worker::emit_chats` is not sufficient.
+
+`Action::StartChat` creates an intentionally empty direct chat in `App::chats` and sets `App::open_chat`.
+
+If a later `Event::Chats` omits it (because the worker sees `last == None` and `last_activity == 0` in SQLite):
+- `self.chats` is replaced with `chats`.
+- The open chat disappears from `self.chats`.
+- `self.open_chat` becomes `None` (view closes unexpectedly).
+
+Therefore, the eventual implementation must preserve explicitly started/open chats across updates.
+
+## Test state
+
+Six regression tests are present in the test suite:
+
+1. `canonical_direct_chat_without_messages_or_activity_is_not_emitted_in_chats`: **FAIL** (reproduces the bug on current `main`).
+2. `early_privacy_id_mute_reaches_the_canonical_chat_without_a_duplicate`: **PASS** (existing privacy-ID deduplication test passes unchanged).
+3. `valid_empty_group_remains_visible_in_chats`: **PASS** (empty group is retained).
+4. `valid_empty_channel_remains_visible_in_chats`: **PASS** (empty channel is retained).
+5. `direct_chat_with_activity_but_no_local_messages_remains_visible`: **PASS** (chat with `last_activity > 0` is retained for on-demand fetch).
+6. `direct_chat_created_via_start_chat_does_not_disappear_on_empty_chats_event`: **FAIL** (proves that omitting empty chats in `Event::Chats` closes `open_chat` in `App`).
+
+## Production code status
+
+No production fix has been approved or implemented yet. Source code changes are strictly test-only.
+
+## Proposed solution status
+
+Antigravity proposed a collaborative Worker/App approach (Option D), but it is NOT approved yet. It must be reviewed before implementation.
+
+## Next step
+
+Review the implementation boundary and design the smallest safe fix before touching production code.
