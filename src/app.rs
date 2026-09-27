@@ -8544,6 +8544,41 @@ mod tests {
     }
 
     #[test]
+    fn direct_chat_created_via_start_chat_does_not_disappear_on_empty_chats_event() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, events) = App::headless(AppDirs::under(root.path()), Settings::default());
+        let ctx = egui::Context::default();
+        let target = "491700000077@s.whatsapp.net";
+
+        app.apply(
+            Action::StartChat {
+                id: target.into(),
+                name: "New Contact".into(),
+            },
+            &ctx,
+        );
+        assert_eq!(app.open_chat.as_deref(), Some(target));
+        assert!(app.chat(target).is_some());
+
+        // When a fresh Event::Chats arrives from the backend that does not include
+        // this newly opened zero-message chat, it must not disappear from app.chats
+        // nor cause open_chat to be closed.
+        let other_chat = Chat::new("491711111111@s.whatsapp.net".into(), "Other".into());
+        events.send(Event::Chats(vec![other_chat])).unwrap();
+        app.handle_events();
+
+        assert_eq!(
+            app.open_chat.as_deref(),
+            Some(target),
+            "an open chat explicitly started must not be closed by an Event::Chats update"
+        );
+        assert!(
+            app.chat(target).is_some(),
+            "an open chat explicitly started must remain present in app.chats"
+        );
+    }
+
+    #[test]
     fn muting_all_channels_leaves_other_chats_alone() {
         let mut app = app();
         let (backend, mut commands) = Backend::recording();

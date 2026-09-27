@@ -11898,6 +11898,108 @@ mod receipt_tests {
     }
 
     #[test]
+    fn canonical_direct_chat_without_messages_or_activity_is_not_emitted_in_chats() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        const EMPTY_DIRECT: &str = "491700000099@s.whatsapp.net";
+        let history = ParsedHistory {
+            chats: vec![parse_conversation(wa::Conversation {
+                id: EMPTY_DIRECT.into(),
+                conversation_timestamp: Some(0),
+                unread_count: Some(0),
+                ..Default::default()
+            })],
+            push_names: Vec::new(),
+            lids: Vec::new(),
+            stickers: Vec::new(),
+        };
+        worker.apply_history(history, true);
+        worker.emit_chats();
+        let chats = events
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Chats(chats) => Some(chats),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        assert!(
+            !chats.iter().any(|chat| chat.id == EMPTY_DIRECT),
+            "canonical direct chat without messages or activity must not be in Event::Chats"
+        );
+    }
+
+    #[test]
+    fn valid_empty_group_remains_visible_in_chats() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        const EMPTY_GROUP: &str = "123456789-987654321@g.us";
+        worker.ensure_chat(EMPTY_GROUP, Some("Discussion Group"));
+        worker.emit_chats();
+        let chats = events
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Chats(chats) => Some(chats),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        assert!(
+            chats.iter().any(|chat| chat.id == EMPTY_GROUP),
+            "a valid empty group must remain present in Event::Chats"
+        );
+    }
+
+    #[test]
+    fn valid_empty_channel_remains_visible_in_chats() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        const EMPTY_CHANNEL: &str = "1234567890123456@newsletter";
+        worker.ensure_chat(EMPTY_CHANNEL, Some("News Channel"));
+        worker.emit_chats();
+        let chats = events
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Chats(chats) => Some(chats),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        assert!(
+            chats.iter().any(|chat| chat.id == EMPTY_CHANNEL),
+            "a valid empty channel must remain present in Event::Chats"
+        );
+    }
+
+    #[test]
+    fn direct_chat_with_activity_but_no_local_messages_remains_visible() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        const REMOTE_CHAT: &str = "491700000088@s.whatsapp.net";
+        let history = ParsedHistory {
+            chats: vec![parse_conversation(wa::Conversation {
+                id: REMOTE_CHAT.into(),
+                conversation_timestamp: Some(1_700_000_000),
+                unread_count: Some(0),
+                ..Default::default()
+            })],
+            push_names: Vec::new(),
+            lids: Vec::new(),
+            stickers: Vec::new(),
+        };
+        worker.apply_history(history, true);
+        worker.emit_chats();
+        let chats = events
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Chats(chats) => Some(chats),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        assert!(
+            chats.iter().any(|chat| chat.id == REMOTE_CHAT),
+            "a direct chat with last_activity > 0 must remain present in Event::Chats"
+        );
+    }
+
+    #[test]
     fn history_without_mute_metadata_preserves_the_existing_history_value() {
         let (mut worker, _events, _inbox, _wa) = worker();
         let mut first = history(0);
