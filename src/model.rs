@@ -198,6 +198,20 @@ impl Chat {
         self.kind == ChatKind::Group
     }
 
+    /// Whether this chat is an established conversation thread to display in the chat list.
+    pub fn is_established(&self) -> bool {
+        self.is_group()
+            || self.is_channel()
+            || self.last.is_some()
+            || self.last_activity > 0
+            || self.pinned
+            || self.pinned_at > 0
+            || self.favorite
+            || self.archived
+            || self.locked
+            || self.looks_unread()
+    }
+
     /// Counted unread, or marked unread with nothing pending.
     pub fn looks_unread(&self) -> bool {
         self.unread > 0 || self.marked_unread

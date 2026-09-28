@@ -1087,7 +1087,9 @@ impl Worker {
             Ok(mut chats) => {
                 // Early preference sync can create an empty privacy-id row.
                 // Once mapped, its preferences live on the canonical chat.
-                chats.retain(|chat| chat.last.is_some() || self.canonical_str(&chat.id) == chat.id);
+                chats.retain(|chat| {
+                    self.canonical_str(&chat.id) == chat.id && chat.is_established()
+                });
                 for chat in &mut chats {
                     self.polish_chat(chat);
                 }

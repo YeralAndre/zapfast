@@ -1846,11 +1846,20 @@ impl App {
                         }
                     }
                 }
-                Event::Chats(chats) => {
+                Event::Chats(mut chats) => {
                     for chat in &chats {
                         if chat.unread == 0 {
                             self.notifications.clear(&chat.id);
                         }
+                    }
+                    if let Some(open_id) = &self.open_chat
+                        && let Some(open_chat) = self.chat(open_id).cloned()
+                        && !open_chat.is_group()
+                        && !open_chat.is_channel()
+                        && !open_chat.is_established()
+                        && !chats.iter().any(|chat| &chat.id == open_id)
+                    {
+                        chats.push(open_chat);
                     }
                     self.chats = chats;
                     if let Some(open) = self.open_chat.clone() {
@@ -2401,7 +2410,8 @@ impl App {
         }
         match self.chats.iter_mut().find(|known| known.id == chat.id) {
             Some(existing) => *existing = chat,
-            None => self.chats.push(chat),
+            None if chat.is_established() => self.chats.push(chat),
+            None => {}
         }
         self.chats
             .sort_by_key(|chat| std::cmp::Reverse(chat.last_activity));
@@ -8576,6 +8586,74 @@ mod tests {
             app.chat(target).is_some(),
             "an open chat explicitly started must remain present in app.chats"
         );
+    }
+
+    #[test]
+    fn established_open_chat_closes_when_removed_from_chats_event() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, events) = App::headless(AppDirs::under(root.path()), Settings::default());
+        let ctx = egui::Context::default();
+        let target = "491700000055@s.whatsapp.net";
+
+        let mut chat = Chat::new(target.into(), "Friend".into());
+        chat.last_activity = 1_700_000_000;
+        app.chats = vec![chat];
+
+        app.apply(Action::OpenChat(target.into()), &ctx);
+        assert_eq!(app.open_chat.as_deref(), Some(target));
+
+        // When Event::Chats arrives without this established chat (e.g. deleted remotely),
+        // it must not be preserved, and open_chat must close.
+        let other_chat = Chat::new("491711111111@s.whatsapp.net".into(), "Other".into());
+        events.send(Event::Chats(vec![other_chat])).unwrap();
+        app.handle_events();
+
+        assert_eq!(
+            app.open_chat, None,
+            "an established chat removed from Event::Chats must be closed"
+        );
+        assert!(
+            app.chat(target).is_none(),
+            "an established chat removed from Event::Chats must not remain in app.chats"
+        );
+    }
+
+    #[test]
+    fn untouched_contact_remains_available_in_matching_contacts_after_history_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, events) = App::headless(AppDirs::under(root.path()), Settings::default());
+        let target = "491700000033@s.whatsapp.net";
+
+        // Contact arrives from address book sync
+        let contact = Contact {
+            id: target.into(),
+            full_name: Some("Alice Wonderland".into()),
+            push_name: None,
+        };
+        events.send(Event::Contacts(vec![contact])).unwrap();
+
+        // Simulate an empty non-established chat update arriving from history sync
+        let empty_chat = Chat::new(target.into(), "Alice Wonderland".into());
+        events
+            .send(Event::ChatUpdated(Box::new(empty_chat)))
+            .unwrap();
+        app.handle_events();
+
+        // The non-established empty chat must NOT have been pushed into app.chats
+        assert!(
+            app.chat(target).is_none(),
+            "untouched direct contact must not be added to app.chats via ChatUpdated"
+        );
+
+        // Searching for the contact name must return it in matching_contacts
+        app.search = "Alice".into();
+        let matches = app.matching_contacts();
+        assert_eq!(
+            matches.len(),
+            1,
+            "untouched contact must appear in matching_contacts"
+        );
+        assert_eq!(matches[0].id, target);
     }
 
     #[test]
