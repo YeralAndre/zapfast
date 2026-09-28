@@ -8474,7 +8474,10 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
         unread: conversation.unread_count,
         marked_unread: conversation.marked_as_unread,
         archived: conversation.archived,
-        pinned_at: conversation.pinned.map(|when| i64::from(when) * 1000),
+        pinned_at: conversation
+            .pinned
+            .filter(|&when| when > 0)
+            .map(|when| i64::from(when) * 1000),
         muted_until: conversation.mute_end_time.map(|end| {
             // Zero explicitly clears a history mute; a wrapped -1 means
             // indefinite. Absence of the field must preserve existing state.
@@ -11895,6 +11898,94 @@ mod receipt_tests {
             worker.archive.chat(PEER).unwrap().unwrap().muted_until,
             None
         );
+    }
+
+    #[test]
+    fn pinned_chat_without_pin_updated_at_survives_history_with_zero_pin() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let mut chat = Chat::new(PEER.into(), "Peer".into());
+        chat.pinned = true;
+        chat.pinned_at = 123_000;
+        worker.archive.upsert_chat(&chat).unwrap();
+
+        let before = worker.archive.chat(PEER).unwrap().expect("chat exists");
+        assert!(before.pinned);
+        assert_eq!(before.pinned_at, 123_000);
+
+        // History chunk arrives with pinned=Some(0)
+        let stale = ParsedHistory {
+            chats: vec![parse_conversation(wa::Conversation {
+                id: PEER.into(),
+                unread_count: Some(0),
+                conversation_timestamp: Some(200),
+                pinned: Some(0),
+                ..Default::default()
+            })],
+            push_names: Vec::new(),
+            lids: Vec::new(),
+            stickers: Vec::new(),
+        };
+        worker.apply_history(stale, true);
+
+        let after = worker.archive.chat(PEER).unwrap().expect("chat exists");
+        assert!(
+            after.pinned,
+            "an existing pinned chat without pin_updated_at must remain pinned when history sends pinned=Some(0)"
+        );
+        assert_eq!(after.pinned_at, 123_000);
+    }
+
+    #[tokio::test]
+    async fn pin_update_on_unresolved_lid_migrates_to_canonical_chat() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        let time = whatsapp_rust::wacore::time::now_utc();
+
+        // 1. PinUpdate is applied to an unresolved @lid.
+        let pin = wa_events::PinUpdate::builder()
+            .jid(PEER_LID.parse().unwrap())
+            .timestamp(time)
+            .from_full_sync(true)
+            .action(Box::new(wa::sync_action_value::PinAction {
+                pinned: Some(true),
+            }))
+            .build();
+        worker
+            .handle_wa_event(Arc::new(wa_events::Event::PinUpdate(pin)))
+            .await;
+
+        // 2. The chat becomes pinned on that row.
+        let lid_chat = worker
+            .archive
+            .chat(PEER_LID)
+            .unwrap()
+            .expect("creates lid chat");
+        assert!(lid_chat.pinned);
+        assert_eq!(lid_chat.pinned_at, time.timestamp_millis());
+
+        // 3. The lid -> phone JID mapping is learned afterward.
+        worker.learn_lid("167650256810092", "4917663430455");
+
+        // 4. The canonical phone-JID chat receives pinned, pinned_at and pin_updated_at correctly.
+        let canonical_chat = worker
+            .archive
+            .chat(PEER)
+            .unwrap()
+            .expect("canonical chat exists");
+        assert!(canonical_chat.pinned, "canonical chat must be pinned");
+        assert_eq!(canonical_chat.pinned_at, time.timestamp_millis());
+
+        // 5. No duplicate pinned chat remains visible/emitted.
+        worker.emit_chats();
+        let chats = events
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Chats(chats) => Some(chats),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        assert!(chats.iter().any(|chat| chat.id == PEER && chat.pinned));
+        assert!(!chats.iter().any(|chat| chat.id == PEER_LID));
     }
 
     #[test]
