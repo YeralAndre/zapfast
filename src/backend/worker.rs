@@ -1629,6 +1629,7 @@ impl Worker {
             self.privacy_reveal_at = None;
             self.reveal_private_content();
         } else {
+            self.privacy_snapshot = false;
             self.privacy_attempts = self.privacy_attempts.saturating_add(1);
             self.privacy_retry = Instant::now() + privacy_backoff(self.privacy_attempts);
             log::warn!(
@@ -9640,6 +9641,44 @@ mod tests {
         // A second failure warns no further.
         worker.preferences_recovered(0, false, false);
         assert_eq!(worker.privacy_attempts, 2);
+    }
+
+    #[test]
+    fn failed_snapshot_recovery_transitions_to_incremental_and_retries() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        unconfirmed(&mut worker);
+        worker.privacy_snapshot = true;
+
+        // 1. Worker starts with privacy_snapshot = true.
+        assert!(worker.privacy_snapshot);
+
+        // 2. Snapshot recovery returns an error (locks=false, complete=false).
+        worker.preferences_recovered(0, false, false);
+
+        // 3. Worker keeps recovery incomplete.
+        assert!(!worker.privacy_confirmed);
+        assert!(
+            worker
+                .archive
+                .meta("chat_privacy_ready_v1")
+                .unwrap()
+                .is_none()
+        );
+
+        // 4. privacy_snapshot becomes false.
+        assert!(!worker.privacy_snapshot);
+
+        // 5. The next recovery attempt selects Incremental, not Snapshot.
+        let next_mode = if worker.privacy_snapshot {
+            whatsapp_rust::AppStateResyncMode::Snapshot
+        } else {
+            whatsapp_rust::AppStateResyncMode::Incremental
+        };
+        assert_eq!(next_mode, whatsapp_rust::AppStateResyncMode::Incremental);
+
+        // 6. Retry/backoff behavior remains active.
+        assert_eq!(worker.privacy_attempts, 1);
+        assert!(worker.privacy_retry > Instant::now());
     }
 
     #[test]
