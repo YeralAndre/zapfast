@@ -1697,6 +1697,20 @@ impl Archive {
         Ok(existing)
     }
 
+    pub fn unarchive_chats_setting(&self) -> Result<Option<bool>> {
+        const KEY: &str = "setting_unarchive_chats";
+        Ok(self.meta(KEY)?.and_then(|value| match value.as_str() {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        }))
+    }
+
+    pub fn set_unarchive_chats_setting(&self, unarchive: bool) -> Result<()> {
+        const KEY: &str = "setting_unarchive_chats";
+        self.set_meta(KEY, if unarchive { "1" } else { "0" })
+    }
+
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         self.connection.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -3431,5 +3445,17 @@ mod media_path_tests {
             .clear_media_path("a@s.whatsapp.net", "p1")
             .expect("cleared");
         assert!(archive.media_paths().expect("lists").is_empty());
+    }
+
+    #[test]
+    fn unarchive_chats_setting_round_trips() {
+        let archive = Archive::in_memory().expect("opens");
+        assert_eq!(archive.unarchive_chats_setting().unwrap(), None);
+
+        archive.set_unarchive_chats_setting(true).unwrap();
+        assert_eq!(archive.unarchive_chats_setting().unwrap(), Some(true));
+
+        archive.set_unarchive_chats_setting(false).unwrap();
+        assert_eq!(archive.unarchive_chats_setting().unwrap(), Some(false));
     }
 }

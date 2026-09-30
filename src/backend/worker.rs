@@ -528,6 +528,7 @@ pub async fn run(
         early: Default::default(),
         link_watch: Default::default(),
         forward_queue: None,
+        unarchive_chats: None,
     };
     worker.load_state();
     worker.backfill();
@@ -798,6 +799,8 @@ struct Worker {
     downloads: HashSet<(ChatId, String, Option<usize>)>,
     /// Serial forward in flight. The next send waits for the running one.
     forward_queue: Option<ForwardQueue<ForwardJob>>,
+    /// Account preference: unarchive chats on incoming messages.
+    unarchive_chats: Option<bool>,
 }
 
 /// A queued forward: where it goes, the protobuf, and its disappearing timer.
@@ -1255,6 +1258,7 @@ impl Worker {
                 .map(|contact| (contact.id.clone(), contact))
                 .collect();
         }
+        self.unarchive_chats = self.archive.unarchive_chats_setting().ok().flatten();
         if self.me_pn.is_some() || self.me_lid.is_some() {
             self.emit(self.me_event());
         }
@@ -2427,6 +2431,13 @@ impl Worker {
             E::RemoveRecentStickerUpdate(update) => self.recent_sticker_removed(update),
             E::FavoriteStickerUpdate(update) => self.favorite_sticker_update(update),
             E::FavoritesUpdate(update) => self.favorite_chats_update(update),
+            E::UnarchiveChatsSettingUpdate(update) => {
+                let unarchive = update.unarchive_chats;
+                self.unarchive_chats = Some(unarchive);
+                if let Err(error) = self.archive.set_unarchive_chats_setting(unarchive) {
+                    log::warn!("could not persist unarchive chats setting: {error}");
+                }
+            }
             E::LockChatUpdate(update) => {
                 let chat = self.canonical(&update.jid);
                 self.ensure_chat(&chat, None);
@@ -3617,6 +3628,19 @@ impl Worker {
             // A reply sent from the phone/another companion reads the preceding
             // conversation there. Replayed replies cannot clear newer arrivals.
             let _ = self.archive.mark_read_to(&chat, &message.id);
+        }
+        if is_new
+            && !message.from_me
+            && self.unarchive_chats == Some(true)
+            && self
+                .archive
+                .chat(&chat)
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.archived)
+        {
+            let timestamp_ms = message.timestamp.saturating_mul(1000);
+            let _ = self.archive.set_archived_at(&chat, false, timestamp_ms);
         }
         let mut stored = self
             .archive
@@ -11271,6 +11295,7 @@ mod receipt_tests {
             early: Default::default(),
             link_watch: Default::default(),
             forward_queue: None,
+            unarchive_chats: None,
         };
         (worker, events_rx, inbox, wa_events)
     }
@@ -12431,6 +12456,169 @@ mod receipt_tests {
         unarchived.chats[0].archived = Some(false);
         worker.apply_history(unarchived, true);
         assert!(!worker.archive.chat(PEER).unwrap().unwrap().archived);
+    }
+
+    #[tokio::test]
+    async fn incoming_message_unarchives_when_unarchive_setting_enabled() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        worker.archive.ensure_chat(PEER, "Peer").unwrap();
+        worker.archive.set_archived_at(PEER, true, 100_000).unwrap();
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
+
+        let update = wa_events::UnarchiveChatsSettingUpdate::builder()
+            .unarchive_chats(true)
+            .timestamp(whatsapp_rust::wacore::time::now_utc())
+            .from_full_sync(false)
+            .action(Box::new(wa::sync_action_value::UnarchiveChatsSetting {
+                unarchive_chats: Some(true),
+            }))
+            .build();
+        worker
+            .handle_wa_event(Arc::new(wa_events::Event::UnarchiveChatsSettingUpdate(
+                update,
+            )))
+            .await;
+        assert_eq!(worker.unarchive_chats, Some(true));
+
+        worker.archive_message(incoming("m1", 200), None, None, false);
+
+        assert!(!worker.archive.chat(PEER).unwrap().unwrap().archived);
+        let updated = events
+            .into_iter()
+            .find_map(|event| match event {
+                Event::ChatUpdated(chat) if chat.id == PEER => Some(chat),
+                _ => None,
+            })
+            .expect("ChatUpdated event");
+        assert!(!updated.archived);
+    }
+
+    #[tokio::test]
+    async fn incoming_message_remains_archived_when_unarchive_setting_disabled() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        worker.archive.ensure_chat(PEER, "Peer").unwrap();
+        worker.archive.set_archived_at(PEER, true, 100_000).unwrap();
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
+
+        let update = wa_events::UnarchiveChatsSettingUpdate::builder()
+            .unarchive_chats(false)
+            .timestamp(whatsapp_rust::wacore::time::now_utc())
+            .from_full_sync(false)
+            .action(Box::new(wa::sync_action_value::UnarchiveChatsSetting {
+                unarchive_chats: Some(false),
+            }))
+            .build();
+        worker
+            .handle_wa_event(Arc::new(wa_events::Event::UnarchiveChatsSettingUpdate(
+                update,
+            )))
+            .await;
+        assert_eq!(worker.unarchive_chats, Some(false));
+
+        worker.archive_message(incoming("m1", 200), None, None, false);
+
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
+        let updated = events
+            .into_iter()
+            .find_map(|event| match event {
+                Event::ChatUpdated(chat) if chat.id == PEER => Some(chat),
+                _ => None,
+            })
+            .expect("ChatUpdated event");
+        assert!(updated.archived);
+    }
+
+    #[test]
+    fn incoming_message_remains_archived_when_unarchive_setting_unknown() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        worker.archive.ensure_chat(PEER, "Peer").unwrap();
+        worker.archive.set_archived_at(PEER, true, 100_000).unwrap();
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
+        assert_eq!(worker.unarchive_chats, None);
+
+        worker.archive_message(incoming("m1", 200), None, None, false);
+
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
+        let updated = events
+            .into_iter()
+            .find_map(|event| match event {
+                Event::ChatUpdated(chat) if chat.id == PEER => Some(chat),
+                _ => None,
+            })
+            .expect("ChatUpdated event");
+        assert!(updated.archived);
+    }
+
+    #[test]
+    fn sent_message_does_not_unarchive_archived_chat() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        worker.archive.ensure_chat(PEER, "Peer").unwrap();
+        worker.archive.set_archived_at(PEER, true, 100_000).unwrap();
+        worker.unarchive_chats = Some(true);
+
+        worker.archive_message(own_message("m1", 200), None, None, false);
+
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
+        let updated = events
+            .into_iter()
+            .find_map(|event| match event {
+                Event::ChatUpdated(chat) if chat.id == PEER => Some(chat),
+                _ => None,
+            })
+            .expect("ChatUpdated event");
+        assert!(updated.archived);
+    }
+
+    #[test]
+    fn duplicate_or_existing_incoming_message_does_not_unarchive() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        worker.archive.ensure_chat(PEER, "Peer").unwrap();
+        worker.unarchive_chats = Some(true);
+
+        worker
+            .archive
+            .insert_message(&incoming("m1", 100), None)
+            .unwrap();
+        worker.archive.set_archived_at(PEER, true, 200_000).unwrap();
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
+
+        worker.archive_message(incoming("m1", 100), None, None, false);
+
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
+        let updated = events
+            .try_iter()
+            .find_map(|event| match event {
+                Event::ChatUpdated(chat) if chat.id == PEER => Some(chat),
+                _ => None,
+            })
+            .expect("ChatUpdated event");
+        assert!(updated.archived);
+    }
+
+    #[tokio::test]
+    async fn explicit_newer_archive_update_wins_over_older_incoming_message() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        worker.archive.ensure_chat(PEER, "Peer").unwrap();
+        worker.unarchive_chats = Some(true);
+
+        let archive_time = whatsapp_rust::wacore::time::from_millis(300_000).unwrap();
+        let archive = wa_events::ArchiveUpdate::builder()
+            .jid(PEER.parse().unwrap())
+            .timestamp(archive_time)
+            .from_full_sync(false)
+            .action(Box::new(wa::sync_action_value::ArchiveChatAction {
+                archived: Some(true),
+                ..Default::default()
+            }))
+            .build();
+        worker
+            .handle_wa_event(Arc::new(wa_events::Event::ArchiveUpdate(archive)))
+            .await;
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
+
+        worker.archive_message(incoming("m-old", 200), None, None, false);
+
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
     }
 
     #[test]
